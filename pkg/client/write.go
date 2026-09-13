@@ -26,6 +26,22 @@ const (
 	maxErrMsgLen = 256
 )
 
+// DuplicatedSamplesValueStrategy controls the value assigned to duplicated samples.
+type DuplicatedSamplesValueStrategy string
+
+const (
+	SameValue      DuplicatedSamplesValueStrategy = "same-value"
+	DifferentValue DuplicatedSamplesValueStrategy = "different-value"
+)
+
+// DuplicatedSamplesDistributionStrategy controls how duplicated samples are distributed across series.
+type DuplicatedSamplesDistributionStrategy string
+
+const (
+	SameSeries      DuplicatedSamplesDistributionStrategy = "same-series"
+	DifferentSeries DuplicatedSamplesDistributionStrategy = "different-series"
+)
+
 type WriteClientConfig struct {
 	// Cortex URL.
 	URL url.URL
@@ -42,6 +58,18 @@ type WriteClientConfig struct {
 
 	// Number of extra labels to generate per write request.
 	ExtraLabels int
+
+	// Number of different samples to generate in each series.
+	SamplesPerSeries int
+
+	// Number of occurrences of each sample within a single series.
+	ReplicasPerSample int
+
+	// Duplicated samples value strategy.
+	DuplicatedSamplesValueStrategy DuplicatedSamplesValueStrategy
+
+	// Duplicated samples distribution strategy.
+	DuplicatedSamplesDistributionStrategy DuplicatedSamplesDistributionStrategy
 
 	WriteInterval    time.Duration
 	WriteTimeout     time.Duration
@@ -86,7 +114,7 @@ func (c *WriteClient) run() {
 
 func (c *WriteClient) writeSeries() {
 	ts := alignTimestampToInterval(time.Now(), c.cfg.WriteInterval)
-	series := generateSineWaveSeries(ts, c.cfg.SeriesCount, c.cfg.ExtraLabels, c.cfg.SeriesChurnPeriod)
+	series := generateSineWaveSeries(ts, c.cfg)
 
 	// Honor the batch size.
 	wg := sync.WaitGroup{}
@@ -167,21 +195,55 @@ func alignTimestampToInterval(ts time.Time, interval time.Duration) time.Time {
 	return time.Unix(0, (ts.UnixNano()/int64(interval))*int64(interval))
 }
 
-func generateSineWaveSeries(t time.Time, seriesCount, extraLabelsCount int, churnPeriod time.Duration) []*prompb.TimeSeries {
-	out := make([]*prompb.TimeSeries, 0, seriesCount)
-	value := generateSineWaveValue(t)
+func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) []*prompb.TimeSeries {
+	seriesCap := cfg.SeriesCount
+	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries {
+		seriesCap *= cfg.ReplicasPerSample
+	}
+	out := make([]*prompb.TimeSeries, 0, seriesCap)
 
 	// Generate the extra labels.
-	extraLabels := make([]*prompb.Label, 0, extraLabelsCount)
-	for j := 0; j < extraLabelsCount; j++ {
+	extraLabels := make([]*prompb.Label, 0, cfg.ExtraLabels)
+	for j := 0; j < cfg.ExtraLabels; j++ {
 		extraLabels = append(extraLabels, &prompb.Label{
 			Name:  fmt.Sprintf("extraLabel%d", j),
 			Value: "default",
 		})
 	}
 
-	for seriesID := 1; seriesID <= seriesCount; seriesID++ {
-		labels := make([]*prompb.Label, 0, 3+extraLabelsCount)
+	// Generate the samples: timestamps uniformly distributed between t and t+cfg.WriteInterval,
+	// each with its own value based on its timestamp, and each replicated cfg.ReplicasPerSample
+	// times. Depending on cfg.DuplicatedSamplesValueStrategy, replicas of the same sample either
+	// all share the same value or each get their own distinct value.
+	//
+	// samples[r] holds the cfg.SamplesPerSeries samples belonging to replica r, so there are
+	// cfg.ReplicasPerSample slices of cfg.SamplesPerSeries elements each.
+	samples := make([][]prompb.Sample, cfg.ReplicasPerSample)
+	for r := 0; r < cfg.ReplicasPerSample; r++ {
+		samples[r] = make([]prompb.Sample, 0, cfg.SamplesPerSeries)
+	}
+
+	for i := 0; i < cfg.SamplesPerSeries; i++ {
+		sampleTs := t.Add(cfg.WriteInterval * time.Duration(i) / time.Duration(cfg.SamplesPerSeries))
+
+		for r := 0; r < cfg.ReplicasPerSample; r++ {
+			replicaValue := generateSineWaveValue(sampleTs)
+			if cfg.DuplicatedSamplesValueStrategy == DifferentValue && r > 0 {
+				// A sub-millisecond offset would be rounded away by the float64 conversion
+				// inside generateSineWaveValue for typical (post-1970) timestamps, producing
+				// the same value as r == 0. Millisecond offsets are coarse enough to survive it.
+				replicaValue = generateSineWaveValue(sampleTs.Add(time.Duration(r) * time.Millisecond))
+			}
+
+			samples[r] = append(samples[r], prompb.Sample{
+				Value:     replicaValue,
+				Timestamp: sampleTs.UnixMilli(),
+			})
+		}
+	}
+
+	for seriesID := 1; seriesID <= cfg.SeriesCount; seriesID++ {
+		labels := make([]*prompb.Label, 0, 3+cfg.ExtraLabels)
 		labels = append(labels, &prompb.Label{
 			Name:  "__name__",
 			Value: "cortex_load_generator_sine_wave",
@@ -194,11 +256,11 @@ func generateSineWaveSeries(t time.Time, seriesCount, extraLabelsCount int, chur
 		labels = append(labels, extraLabels...)
 
 		// Add a label to simulate churning series.
-		if churnPeriod > 0 {
+		if cfg.SeriesChurnPeriod > 0 {
 			// Spread churning series over the "churn period" we compute the churn ID
 			// starting from the current time, shifted by the series ID. Then the value
 			// is rounded so that it changes every "churn period".
-			churnID := t.Add((churnPeriod/time.Duration(seriesCount))*time.Duration(seriesID)).Unix() / int64(churnPeriod.Seconds())
+			churnID := t.Add((cfg.SeriesChurnPeriod/time.Duration(cfg.SeriesCount))*time.Duration(seriesID)).Unix() / int64(cfg.SeriesChurnPeriod.Seconds())
 
 			labels = append(labels, &prompb.Label{
 				Name:  "churn",
@@ -213,17 +275,36 @@ func generateSineWaveSeries(t time.Time, seriesCount, extraLabelsCount int, chur
 			}
 			return labels[i].Value < labels[j].Value
 		})
-
-		out = append(out, &prompb.TimeSeries{
-			Labels: labels,
-			Samples: []prompb.Sample{{
-				Value:     value,
-				Timestamp: t.UnixMilli(),
-			}},
-		})
+		out = append(out, distributeSamples(samples, labels, cfg)...)
 	}
 
 	return out
+}
+
+func distributeSamples(samples [][]prompb.Sample, labels []*prompb.Label, cfg WriteClientConfig) []*prompb.TimeSeries {
+	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries {
+		out := make([]*prompb.TimeSeries, 0, cfg.ReplicasPerSample)
+		// Distribute each replica to its own series entry, duplicating the labels so
+		// that they still identify the same underlying series.
+		for r := 0; r < cfg.ReplicasPerSample; r++ {
+			out = append(out, &prompb.TimeSeries{
+				Labels:  labels,
+				Samples: samples[r],
+			})
+		}
+		return out
+	}
+
+	// Put every replica of every sample into the same series, keeping samples
+	// ordered by timestamp and, for a given timestamp, by replica.
+	seriesSamples := make([]prompb.Sample, 0, cfg.SamplesPerSeries*cfg.ReplicasPerSample)
+	for r := 0; r < cfg.ReplicasPerSample; r++ {
+		seriesSamples = append(seriesSamples, samples[r]...)
+	}
+	return []*prompb.TimeSeries{{
+		Labels:  labels,
+		Samples: seriesSamples,
+	}}
 }
 
 func generateSineWaveValue(t time.Time) float64 {
