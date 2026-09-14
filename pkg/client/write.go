@@ -40,6 +40,11 @@ type DuplicatedSamplesDistributionStrategy string
 const (
 	SameSeries      DuplicatedSamplesDistributionStrategy = "same-series"
 	DifferentSeries DuplicatedSamplesDistributionStrategy = "different-series"
+
+	// DifferentRequest builds timeseries the same way as DifferentSeries (each
+	// replica as its own series entry, sharing the same labels), but each of those
+	// replica series is additionally sent as its own separate write request.
+	DifferentRequest DuplicatedSamplesDistributionStrategy = "different-request"
 )
 
 type WriteClientConfig struct {
@@ -114,11 +119,44 @@ func (c *WriteClient) run() {
 
 func (c *WriteClient) writeSeries() {
 	ts := alignTimestampToInterval(time.Now(), c.cfg.WriteInterval)
-	series := generateSineWaveSeries(ts, c.cfg)
+	seriesGroups := generateSineWaveSeries(ts, c.cfg)
 
-	// Honor the batch size.
 	wg := sync.WaitGroup{}
 
+	if c.cfg.DuplicatedSamplesDistributionStrategy == DifferentRequest {
+		// Send each duplicated series as its own request, going through all
+		// cfg.ReplicasPerSample requests of a given series before moving to the next one.
+		for _, group := range seriesGroups {
+			for _, series := range group {
+				wg.Add(1)
+
+				go func(series *prompb.TimeSeries) {
+					defer wg.Done()
+
+					// Honor the max concurrency
+					ctx := context.Background()
+					_ = c.writeGate.Start(ctx)
+					defer c.writeGate.Done()
+
+					req := &prompb.WriteRequest{
+						Timeseries: []*prompb.TimeSeries{series},
+					}
+
+					err := c.send(ctx, req)
+					if err != nil {
+						level.Error(c.logger).Log("msg", "failed to write series", "err", err)
+					}
+				}(series)
+			}
+		}
+
+		wg.Wait()
+		return
+	}
+
+	series := flattenTimeSeries(seriesGroups)
+
+	// Honor the batch size.
 	for o := 0; o < len(series); o += c.cfg.WriteBatchSize {
 		wg.Add(1)
 
@@ -195,12 +233,12 @@ func alignTimestampToInterval(ts time.Time, interval time.Duration) time.Time {
 	return time.Unix(0, (ts.UnixNano()/int64(interval))*int64(interval))
 }
 
-func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) []*prompb.TimeSeries {
-	seriesCap := cfg.SeriesCount
-	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries {
-		seriesCap *= cfg.ReplicasPerSample
-	}
-	out := make([]*prompb.TimeSeries, 0, seriesCap)
+// generateSineWaveSeries returns, for each of the cfg.SeriesCount series, the list of
+// prompb.TimeSeries entries that carry it (and its duplicates, if any) — so the outer
+// slice has dimension cfg.SeriesCount, and each inner slice has dimension
+// cfg.ReplicasPerSample (or 1 when cfg.DuplicatedSamplesDistributionStrategy is SameSeries).
+func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) [][]*prompb.TimeSeries {
+	out := make([][]*prompb.TimeSeries, 0, cfg.SeriesCount)
 
 	// Generate the extra labels.
 	extraLabels := make([]*prompb.Label, 0, cfg.ExtraLabels)
@@ -275,14 +313,29 @@ func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) []*prompb.TimeSe
 			}
 			return labels[i].Value < labels[j].Value
 		})
-		out = append(out, distributeSamples(samples, labels, cfg)...)
+		out = append(out, distributeSamples(samples, labels, cfg))
+	}
+
+	return out
+}
+
+// flattenTimeSeries concatenates every series group, in order, into a single slice.
+func flattenTimeSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+
+	out := make([]*prompb.TimeSeries, 0, total)
+	for _, group := range groups {
+		out = append(out, group...)
 	}
 
 	return out
 }
 
 func distributeSamples(samples [][]prompb.Sample, labels []*prompb.Label, cfg WriteClientConfig) []*prompb.TimeSeries {
-	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries {
+	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries || cfg.DuplicatedSamplesDistributionStrategy == DifferentRequest {
 		out := make([]*prompb.TimeSeries, 0, cfg.ReplicasPerSample)
 		// Distribute each replica to its own series entry, duplicating the labels so
 		// that they still identify the same underlying series.

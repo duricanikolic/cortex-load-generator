@@ -1,10 +1,18 @@
 package client
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-kit/log"
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +41,7 @@ func TestGenerateSineWaveSeries_WithChurningSeries(t *testing.T) {
 		}
 
 		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, SamplesPerSeries: 1, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
-		assert.Equal(t, expected, generateSineWaveSeries(ts, cfg))
+		assert.Equal(t, expected, flattenTimeSeries(generateSineWaveSeries(ts, cfg)))
 	}
 
 	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
@@ -91,7 +99,7 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries(t *testing.T) {
 		}
 
 		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, SamplesPerSeries: 1, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
-		assert.Equal(t, expected, generateSineWaveSeries(ts, cfg))
+		assert.Equal(t, expected, flattenTimeSeries(generateSineWaveSeries(ts, cfg)))
 	}
 
 	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
@@ -176,6 +184,30 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 			valueStrategy:        DifferentValue,
 			distributionStrategy: DifferentSeries,
 		},
+		"single sample, multiple replicas, same value, different request": {
+			samplesPerSeries:     1,
+			replicasPerSample:    4,
+			valueStrategy:        SameValue,
+			distributionStrategy: DifferentRequest,
+		},
+		"multiple samples, multiple replicas, same value, different request": {
+			samplesPerSeries:     10,
+			replicasPerSample:    4,
+			valueStrategy:        SameValue,
+			distributionStrategy: DifferentRequest,
+		},
+		"single sample, multiple replicas, different value, different request": {
+			samplesPerSeries:     1,
+			replicasPerSample:    4,
+			valueStrategy:        DifferentValue,
+			distributionStrategy: DifferentRequest,
+		},
+		"multiple samples, multiple replicas, different value, different request": {
+			samplesPerSeries:     10,
+			replicasPerSample:    4,
+			valueStrategy:        DifferentValue,
+			distributionStrategy: DifferentRequest,
+		},
 	}
 
 	for name, tc := range testCases {
@@ -205,7 +237,7 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 				for seriesID := 1; seriesID <= numSeries; seriesID++ {
 					labels := []*prompb.Label{{Name: "__name__", Value: "cortex_load_generator_sine_wave"}, {Name: "wave", Value: strconv.Itoa(seriesID)}}
 
-					if tc.distributionStrategy == DifferentSeries {
+					if tc.distributionStrategy == DifferentSeries || tc.distributionStrategy == DifferentRequest {
 						for r := 0; r < tc.replicasPerSample; r++ {
 							expected = append(expected, &prompb.TimeSeries{Labels: labels, Samples: samples[r]})
 						}
@@ -229,7 +261,7 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 					DuplicatedSamplesDistributionStrategy: tc.distributionStrategy,
 					WriteInterval:                         writeInterval,
 				}
-				actual := generateSineWaveSeries(ts, cfg)
+				actual := flattenTimeSeries(generateSineWaveSeries(ts, cfg))
 				assert.Equal(t, expected, actual)
 			}
 
@@ -241,5 +273,122 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 				ts = ts.Add(writeInterval)
 			}
 		})
+	}
+}
+
+func TestGenerateSineWaveSeries_GroupingShape(t *testing.T) {
+	const (
+		numSeries         = 3
+		samplesPerSeries  = 5
+		replicasPerSample = 4
+		writeInterval     = 10 * time.Second
+	)
+
+	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
+	require.NoError(t, err)
+
+	for _, distributionStrategy := range []DuplicatedSamplesDistributionStrategy{SameSeries, DifferentSeries, DifferentRequest} {
+		t.Run(string(distributionStrategy), func(t *testing.T) {
+			cfg := WriteClientConfig{
+				SeriesCount:                           numSeries,
+				SamplesPerSeries:                      samplesPerSeries,
+				ReplicasPerSample:                     replicasPerSample,
+				DuplicatedSamplesDistributionStrategy: distributionStrategy,
+				WriteInterval:                         writeInterval,
+			}
+
+			groups := generateSineWaveSeries(ts, cfg)
+			require.Len(t, groups, numSeries)
+
+			wantReplicasPerGroup := 1
+			if distributionStrategy == DifferentSeries || distributionStrategy == DifferentRequest {
+				wantReplicasPerGroup = replicasPerSample
+			}
+
+			for seriesID, group := range groups {
+				assert.Lenf(t, group, wantReplicasPerGroup, "series %d", seriesID)
+
+				for _, series := range group {
+					assert.Equal(t, strconv.Itoa(seriesID+1), labelValue(series.Labels, "wave"))
+				}
+			}
+		})
+	}
+}
+
+func labelValue(labels []*prompb.Label, name string) string {
+	for _, l := range labels {
+		if l.Name == name {
+			return l.Value
+		}
+	}
+	return ""
+}
+
+func TestWriteClient_DifferentRequestSendsEachReplicaAsItsOwnRequest(t *testing.T) {
+	const (
+		numSeries         = 2
+		replicasPerSample = 3
+	)
+
+	var (
+		mu       sync.Mutex
+		requests []*prompb.WriteRequest
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compressed, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		data, err := snappy.Decode(nil, compressed)
+		require.NoError(t, err)
+
+		var req prompb.WriteRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+
+		mu.Lock()
+		requests = append(requests, &req)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := WriteClientConfig{
+		URL:                                   *serverURL,
+		UserID:                                "test",
+		SeriesCount:                           numSeries,
+		SamplesPerSeries:                      1,
+		ReplicasPerSample:                     replicasPerSample,
+		DuplicatedSamplesDistributionStrategy: DifferentRequest,
+		WriteInterval:                         10 * time.Second,
+		WriteTimeout:                          5 * time.Second,
+		WriteConcurrency:                      10,
+		WriteBatchSize:                        1000,
+	}
+
+	c := NewWriteClient(cfg, log.NewNopLogger())
+	c.writeSeries()
+
+	require.Len(t, requests, numSeries*replicasPerSample)
+
+	seriesByWave := map[string][]*prompb.TimeSeries{}
+	for _, req := range requests {
+		require.Len(t, req.Timeseries, 1)
+		series := req.Timeseries[0]
+		wave := labelValue(series.Labels, "wave")
+		seriesByWave[wave] = append(seriesByWave[wave], series)
+	}
+
+	require.Len(t, seriesByWave, numSeries)
+	for wave, series := range seriesByWave {
+		assert.Lenf(t, series, replicasPerSample, "wave %s", wave)
+		for _, s := range series {
+			assert.Equal(t, series[0].Labels, s.Labels)
+			assert.Equal(t, series[0].Samples, s.Samples)
+		}
 	}
 }

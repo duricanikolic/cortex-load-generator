@@ -37,7 +37,7 @@ var (
 	samplesPerSeries                      = kingpin.Flag("samples-per-series", "Number of different samples to generate in each series.").Default("1").Int()
 	replicasPerSample                     = kingpin.Flag("replicas-per-sample", "Number of occurrences of each sample within a single series.").Default("1").Int()
 	duplicatedSamplesValueStrategy        = kingpin.Flag("duplicated-samples-value-strategy", "Duplicated samples value strategy.").Default(string(client.SameValue)).Enum(string(client.SameValue), string(client.DifferentValue))
-	duplicatedSamplesDistributionStrategy = kingpin.Flag("duplicated-samples-distribution-strategy", "Duplicated samples distribution strategy.").Default(string(client.SameSeries)).Enum(string(client.SameSeries), string(client.DifferentSeries))
+	duplicatedSamplesDistributionStrategy = kingpin.Flag("duplicated-samples-distribution-strategy", "Duplicated samples distribution strategy.").Default(string(client.SameSeries)).Enum(string(client.SameSeries), string(client.DifferentSeries), string(client.DifferentRequest))
 )
 
 func main() {
