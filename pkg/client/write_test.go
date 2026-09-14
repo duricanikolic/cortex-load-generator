@@ -325,10 +325,11 @@ func labelValue(labels []*prompb.Label, name string) string {
 	return ""
 }
 
-func TestWriteClient_DifferentRequestSendsEachReplicaAsItsOwnRequest(t *testing.T) {
+func TestWriteClient_DifferentRequestBatchesEachCopyLevelSeparately(t *testing.T) {
 	const (
-		numSeries         = 2
+		numSeries         = 5
 		replicasPerSample = 3
+		writeBatchSize    = 2
 	)
 
 	var (
@@ -367,20 +368,31 @@ func TestWriteClient_DifferentRequestSendsEachReplicaAsItsOwnRequest(t *testing.
 		WriteInterval:                         10 * time.Second,
 		WriteTimeout:                          5 * time.Second,
 		WriteConcurrency:                      10,
-		WriteBatchSize:                        1000,
+		WriteBatchSize:                        writeBatchSize,
 	}
 
 	c := NewWriteClient(cfg, log.NewNopLogger())
 	c.writeSeries()
 
-	require.Len(t, requests, numSeries*replicasPerSample)
+	// Each of the replicasPerSample copy levels is batched independently, in chunks of
+	// at most writeBatchSize series: ceil(numSeries/writeBatchSize) requests per level.
+	requestsPerLevel := (numSeries + writeBatchSize - 1) / writeBatchSize
+	require.Len(t, requests, replicasPerSample*requestsPerLevel)
 
 	seriesByWave := map[string][]*prompb.TimeSeries{}
 	for _, req := range requests {
-		require.Len(t, req.Timeseries, 1)
-		series := req.Timeseries[0]
-		wave := labelValue(series.Labels, "wave")
-		seriesByWave[wave] = append(seriesByWave[wave], series)
+		assert.LessOrEqual(t, len(req.Timeseries), writeBatchSize)
+
+		// A single request must never mix multiple copies of the same series: that
+		// would mean it crossed copy-level boundaries instead of batching within one.
+		seenWaves := map[string]bool{}
+		for _, series := range req.Timeseries {
+			wave := labelValue(series.Labels, "wave")
+			require.Falsef(t, seenWaves[wave], "wave %s appears twice in the same request", wave)
+			seenWaves[wave] = true
+
+			seriesByWave[wave] = append(seriesByWave[wave], series)
+		}
 	}
 
 	require.Len(t, seriesByWave, numSeries)

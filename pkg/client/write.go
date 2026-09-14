@@ -124,13 +124,16 @@ func (c *WriteClient) writeSeries() {
 	wg := sync.WaitGroup{}
 
 	if c.cfg.DuplicatedSamplesDistributionStrategy == DifferentRequest {
-		// Send each duplicated series as its own request, going through all
-		// cfg.ReplicasPerSample requests of a given series before moving to the next one.
-		for _, group := range seriesGroups {
-			for _, series := range group {
+		// Group the series by "copy level": level 0 holds every series' original
+		// sample, level 1 holds every series' first duplicate, and so on. Each level
+		// is then sent through its own wave of batched requests (honoring
+		// WriteBatchSize), so a single request never mixes series from different
+		// copies.
+		for _, seriesAtLevel := range transposeTimeSeries(seriesGroups) {
+			for o := 0; o < len(seriesAtLevel); o += c.cfg.WriteBatchSize {
 				wg.Add(1)
 
-				go func(series *prompb.TimeSeries) {
+				go func(seriesAtLevel []*prompb.TimeSeries, o int) {
 					defer wg.Done()
 
 					// Honor the max concurrency
@@ -138,15 +141,20 @@ func (c *WriteClient) writeSeries() {
 					_ = c.writeGate.Start(ctx)
 					defer c.writeGate.Done()
 
+					end := o + c.cfg.WriteBatchSize
+					if end > len(seriesAtLevel) {
+						end = len(seriesAtLevel)
+					}
+
 					req := &prompb.WriteRequest{
-						Timeseries: []*prompb.TimeSeries{series},
+						Timeseries: seriesAtLevel[o:end],
 					}
 
 					err := c.send(ctx, req)
 					if err != nil {
 						level.Error(c.logger).Log("msg", "failed to write series", "err", err)
 					}
-				}(series)
+				}(seriesAtLevel, o)
 			}
 		}
 
@@ -332,6 +340,29 @@ func flattenTimeSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
 	}
 
 	return out
+}
+
+// transposeTimeSeries turns a [series][copy] grouping into a [copy][series] one: the
+// returned outer slice has one entry per copy level (e.g. level 0 is every series'
+// original sample, level 1 is every series' first duplicate, and so on), and each of
+// those holds one TimeSeries per input group, in the same order as groups.
+func transposeTimeSeries(groups [][]*prompb.TimeSeries) [][]*prompb.TimeSeries {
+	if len(groups) == 0 {
+		return nil
+	}
+
+	levels := make([][]*prompb.TimeSeries, len(groups[0]))
+	for l := range levels {
+		levels[l] = make([]*prompb.TimeSeries, 0, len(groups))
+	}
+
+	for _, group := range groups {
+		for l, series := range group {
+			levels[l] = append(levels[l], series)
+		}
+	}
+
+	return levels
 }
 
 func distributeSamples(samples [][]prompb.Sample, labels []*prompb.Label, cfg WriteClientConfig) []*prompb.TimeSeries {
