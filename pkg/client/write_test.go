@@ -40,8 +40,10 @@ func TestGenerateSineWaveSeries_WithChurningSeries(t *testing.T) {
 			})
 		}
 
-		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, SamplesPerSeries: 1, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
-		assert.Equal(t, expected, flattenTimeSeries(generateSineWaveSeries(ts, cfg)))
+		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
+		actual := generateSineWaveSeries(ts, cfg)
+		require.Len(t, actual, 1)
+		assert.Equal(t, expected, actual[0])
 	}
 
 	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
@@ -98,8 +100,10 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries(t *testing.T) {
 			})
 		}
 
-		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, SamplesPerSeries: 1, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
-		assert.Equal(t, expected, flattenTimeSeries(generateSineWaveSeries(ts, cfg)))
+		cfg := WriteClientConfig{SeriesCount: numSeries, SeriesChurnPeriod: churnPeriod, ReplicasPerSample: 1, WriteInterval: 10 * time.Second}
+		actual := generateSineWaveSeries(ts, cfg)
+		require.Len(t, actual, 1)
+		assert.Equal(t, expected, actual[0])
 	}
 
 	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
@@ -111,7 +115,7 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries(t *testing.T) {
 	}
 }
 
-func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.T) {
+func TestGenerateSineWaveSeries_WithReplicas(t *testing.T) {
 	const (
 		numSeries     = 3
 		churnPeriod   = 0
@@ -119,91 +123,51 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 	)
 
 	testCases := map[string]struct {
-		samplesPerSeries     int
 		replicasPerSample    int
 		valueStrategy        DuplicatedSamplesValueStrategy
 		distributionStrategy DuplicatedSamplesDistributionStrategy
 	}{
-		"single sample, no replicas": {
-			samplesPerSeries:     1,
+		"no replicas, same series": {
 			replicasPerSample:    1,
 			valueStrategy:        SameValue,
 			distributionStrategy: SameSeries,
 		},
-		"multiple samples, no replicas": {
-			samplesPerSeries:     10,
+		"no replicas, different series": {
 			replicasPerSample:    1,
 			valueStrategy:        SameValue,
-			distributionStrategy: SameSeries,
+			distributionStrategy: DifferentSeries,
 		},
-		"single sample, multiple replicas, same value, same series": {
-			samplesPerSeries:     1,
+		"no replicas, different request": {
+			replicasPerSample:    1,
+			valueStrategy:        SameValue,
+			distributionStrategy: DifferentRequest,
+		},
+		"multiple replicas, same value, same series": {
 			replicasPerSample:    4,
 			valueStrategy:        SameValue,
 			distributionStrategy: SameSeries,
 		},
-		"multiple samples, multiple replicas, same value, same series": {
-			samplesPerSeries:     10,
-			replicasPerSample:    4,
-			valueStrategy:        SameValue,
-			distributionStrategy: SameSeries,
-		},
-		"single sample, multiple replicas, different value, same series": {
-			samplesPerSeries:     1,
+		"multiple replicas, different value, same series": {
 			replicasPerSample:    4,
 			valueStrategy:        DifferentValue,
 			distributionStrategy: SameSeries,
 		},
-		"multiple samples, multiple replicas, different value, same series": {
-			samplesPerSeries:     10,
-			replicasPerSample:    4,
-			valueStrategy:        DifferentValue,
-			distributionStrategy: SameSeries,
-		},
-		"single sample, multiple replicas, same value, different series": {
-			samplesPerSeries:     1,
+		"multiple replicas, same value, different series": {
 			replicasPerSample:    4,
 			valueStrategy:        SameValue,
 			distributionStrategy: DifferentSeries,
 		},
-		"multiple samples, multiple replicas, same value, different series": {
-			samplesPerSeries:     10,
-			replicasPerSample:    4,
-			valueStrategy:        SameValue,
-			distributionStrategy: DifferentSeries,
-		},
-		"single sample, multiple replicas, different value, different series": {
-			samplesPerSeries:     1,
+		"multiple replicas, different value, different series": {
 			replicasPerSample:    4,
 			valueStrategy:        DifferentValue,
 			distributionStrategy: DifferentSeries,
 		},
-		"multiple samples, multiple replicas, different value, different series": {
-			samplesPerSeries:     10,
-			replicasPerSample:    4,
-			valueStrategy:        DifferentValue,
-			distributionStrategy: DifferentSeries,
-		},
-		"single sample, multiple replicas, same value, different request": {
-			samplesPerSeries:     1,
+		"multiple replicas, same value, different request": {
 			replicasPerSample:    4,
 			valueStrategy:        SameValue,
 			distributionStrategy: DifferentRequest,
 		},
-		"multiple samples, multiple replicas, same value, different request": {
-			samplesPerSeries:     10,
-			replicasPerSample:    4,
-			valueStrategy:        SameValue,
-			distributionStrategy: DifferentRequest,
-		},
-		"single sample, multiple replicas, different value, different request": {
-			samplesPerSeries:     1,
-			replicasPerSample:    4,
-			valueStrategy:        DifferentValue,
-			distributionStrategy: DifferentRequest,
-		},
-		"multiple samples, multiple replicas, different value, different request": {
-			samplesPerSeries:     10,
+		"multiple replicas, different value, different request": {
 			replicasPerSample:    4,
 			valueStrategy:        DifferentValue,
 			distributionStrategy: DifferentRequest,
@@ -213,56 +177,57 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			assertGeneratedSeries := func(t *testing.T, ts time.Time) {
-				// samples[r][i] holds the i-th sample of replica r.
-				samples := make([][]prompb.Sample, tc.replicasPerSample)
+				value := generateSineWaveValue(ts)
+
+				// perCopy[r][i] is series i+1's r-th copy — the raw building block,
+				// before it gets grouped per cfg.DuplicatedSamplesDistributionStrategy.
+				perCopy := make([][]*prompb.TimeSeries, tc.replicasPerSample)
 				for r := 0; r < tc.replicasPerSample; r++ {
-					samples[r] = make([]prompb.Sample, 0, tc.samplesPerSeries)
-				}
+					replicaValue := value
+					if tc.valueStrategy == DifferentValue && r > 0 {
+						replicaValue = generateSineWaveValue(ts.Add(time.Duration(r) * time.Millisecond))
+					}
 
-				for i := 0; i < tc.samplesPerSeries; i++ {
-					sampleTs := ts.Add(writeInterval * time.Duration(i) / time.Duration(tc.samplesPerSeries))
-					value := generateSineWaveValue(sampleTs)
-
-					for r := 0; r < tc.replicasPerSample; r++ {
-						replicaValue := value
-						if tc.valueStrategy == DifferentValue && r > 0 {
-							replicaValue = generateSineWaveValue(sampleTs.Add(time.Duration(r) * time.Millisecond))
-						}
-
-						samples[r] = append(samples[r], prompb.Sample{Timestamp: sampleTs.UnixMilli(), Value: replicaValue})
+					perCopy[r] = make([]*prompb.TimeSeries, 0, numSeries)
+					for seriesID := 1; seriesID <= numSeries; seriesID++ {
+						perCopy[r] = append(perCopy[r], &prompb.TimeSeries{
+							Labels:  []*prompb.Label{{Name: "__name__", Value: "cortex_load_generator_sine_wave"}, {Name: "wave", Value: strconv.Itoa(seriesID)}},
+							Samples: []prompb.Sample{{Timestamp: ts.UnixMilli(), Value: replicaValue}},
+						})
 					}
 				}
 
-				expected := make([]*prompb.TimeSeries, 0, numSeries)
-				for seriesID := 1; seriesID <= numSeries; seriesID++ {
-					labels := []*prompb.Label{{Name: "__name__", Value: "cortex_load_generator_sine_wave"}, {Name: "wave", Value: strconv.Itoa(seriesID)}}
-
-					if tc.distributionStrategy == DifferentSeries || tc.distributionStrategy == DifferentRequest {
+				var expected [][]*prompb.TimeSeries
+				switch tc.distributionStrategy {
+				case DifferentRequest:
+					expected = perCopy
+				case SameSeries:
+					merged := make([]*prompb.TimeSeries, numSeries)
+					for i := 0; i < numSeries; i++ {
+						samples := make([]prompb.Sample, 0, tc.replicasPerSample)
 						for r := 0; r < tc.replicasPerSample; r++ {
-							expected = append(expected, &prompb.TimeSeries{Labels: labels, Samples: samples[r]})
+							samples = append(samples, perCopy[r][i].Samples...)
 						}
-						continue
+						merged[i] = &prompb.TimeSeries{Labels: perCopy[0][i].Labels, Samples: samples}
 					}
-
-					seriesSamples := make([]prompb.Sample, 0, tc.samplesPerSeries*tc.replicasPerSample)
+					expected = [][]*prompb.TimeSeries{merged}
+				default: // DifferentSeries
+					flat := make([]*prompb.TimeSeries, 0, tc.replicasPerSample*numSeries)
 					for r := 0; r < tc.replicasPerSample; r++ {
-						seriesSamples = append(seriesSamples, samples[r]...)
+						flat = append(flat, perCopy[r]...)
 					}
-
-					expected = append(expected, &prompb.TimeSeries{Labels: labels, Samples: seriesSamples})
+					expected = [][]*prompb.TimeSeries{flat}
 				}
 
 				cfg := WriteClientConfig{
 					SeriesCount:                           numSeries,
 					SeriesChurnPeriod:                     churnPeriod,
-					SamplesPerSeries:                      tc.samplesPerSeries,
 					ReplicasPerSample:                     tc.replicasPerSample,
 					DuplicatedSamplesValueStrategy:        tc.valueStrategy,
 					DuplicatedSamplesDistributionStrategy: tc.distributionStrategy,
 					WriteInterval:                         writeInterval,
 				}
-				actual := flattenTimeSeries(generateSineWaveSeries(ts, cfg))
-				assert.Equal(t, expected, actual)
+				assert.Equal(t, expected, generateSineWaveSeries(ts, cfg))
 			}
 
 			ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
@@ -276,44 +241,24 @@ func TestGenerateSineWaveSeries_WithoutChurningSeries_WithDuplicates(t *testing.
 	}
 }
 
-func TestGenerateSineWaveSeries_GroupingShape(t *testing.T) {
-	const (
-		numSeries         = 3
-		samplesPerSeries  = 5
-		replicasPerSample = 4
-		writeInterval     = 10 * time.Second
-	)
-
-	ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
-	require.NoError(t, err)
-
-	for _, distributionStrategy := range []DuplicatedSamplesDistributionStrategy{SameSeries, DifferentSeries, DifferentRequest} {
-		t.Run(string(distributionStrategy), func(t *testing.T) {
-			cfg := WriteClientConfig{
-				SeriesCount:                           numSeries,
-				SamplesPerSeries:                      samplesPerSeries,
-				ReplicasPerSample:                     replicasPerSample,
-				DuplicatedSamplesDistributionStrategy: distributionStrategy,
-				WriteInterval:                         writeInterval,
-			}
-
-			groups := generateSineWaveSeries(ts, cfg)
-			require.Len(t, groups, numSeries)
-
-			wantReplicasPerGroup := 1
-			if distributionStrategy == DifferentSeries || distributionStrategy == DifferentRequest {
-				wantReplicasPerGroup = replicasPerSample
-			}
-
-			for seriesID, group := range groups {
-				assert.Lenf(t, group, wantReplicasPerGroup, "series %d", seriesID)
-
-				for _, series := range group {
-					assert.Equal(t, strconv.Itoa(seriesID+1), labelValue(series.Labels, "wave"))
-				}
-			}
-		})
+func TestMergeCopiesPerSeries(t *testing.T) {
+	groups := [][]*prompb.TimeSeries{
+		{
+			{Labels: []*prompb.Label{{Name: "wave", Value: "1"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 1}}},
+			{Labels: []*prompb.Label{{Name: "wave", Value: "2"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 2}}},
+		},
+		{
+			{Labels: []*prompb.Label{{Name: "wave", Value: "1"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 10}}},
+			{Labels: []*prompb.Label{{Name: "wave", Value: "2"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 20}}},
+		},
 	}
+
+	expected := []*prompb.TimeSeries{
+		{Labels: []*prompb.Label{{Name: "wave", Value: "1"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 1}, {Timestamp: 1000, Value: 10}}},
+		{Labels: []*prompb.Label{{Name: "wave", Value: "2"}}, Samples: []prompb.Sample{{Timestamp: 1000, Value: 2}, {Timestamp: 1000, Value: 20}}},
+	}
+
+	assert.Equal(t, expected, mergeCopiesPerSeries(groups))
 }
 
 func labelValue(labels []*prompb.Label, name string) string {
@@ -362,7 +307,6 @@ func TestWriteClient_DifferentRequestBatchesEachCopyLevelSeparately(t *testing.T
 		URL:                                   *serverURL,
 		UserID:                                "test",
 		SeriesCount:                           numSeries,
-		SamplesPerSeries:                      1,
 		ReplicasPerSample:                     replicasPerSample,
 		DuplicatedSamplesDistributionStrategy: DifferentRequest,
 		WriteInterval:                         10 * time.Second,
@@ -402,5 +346,126 @@ func TestWriteClient_DifferentRequestBatchesEachCopyLevelSeparately(t *testing.T
 			assert.Equal(t, series[0].Labels, s.Labels)
 			assert.Equal(t, series[0].Samples, s.Samples)
 		}
+	}
+}
+
+func TestWriteClient_SameSeriesMergesCopiesIntoOneSeriesEntry(t *testing.T) {
+	const (
+		numSeries         = 2
+		replicasPerSample = 3
+	)
+
+	var (
+		mu       sync.Mutex
+		requests []*prompb.WriteRequest
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compressed, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		data, err := snappy.Decode(nil, compressed)
+		require.NoError(t, err)
+
+		var req prompb.WriteRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+
+		mu.Lock()
+		requests = append(requests, &req)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := WriteClientConfig{
+		URL:                                   *serverURL,
+		UserID:                                "test",
+		SeriesCount:                           numSeries,
+		ReplicasPerSample:                     replicasPerSample,
+		DuplicatedSamplesDistributionStrategy: SameSeries,
+		WriteInterval:                         10 * time.Second,
+		WriteTimeout:                          5 * time.Second,
+		WriteConcurrency:                      10,
+		WriteBatchSize:                        1000,
+	}
+
+	c := NewWriteClient(cfg, log.NewNopLogger())
+	c.writeSeries()
+
+	// A single request, holding one merged series per wave (rather than one per copy).
+	require.Len(t, requests, 1)
+	require.Len(t, requests[0].Timeseries, numSeries)
+
+	for _, series := range requests[0].Timeseries {
+		assert.Lenf(t, series.Samples, replicasPerSample, "wave %s", labelValue(series.Labels, "wave"))
+	}
+}
+
+func TestWriteClient_DifferentSeriesBatchesAllCopiesTogether(t *testing.T) {
+	const (
+		numSeries         = 2
+		replicasPerSample = 3
+	)
+
+	var (
+		mu       sync.Mutex
+		requests []*prompb.WriteRequest
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compressed, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		data, err := snappy.Decode(nil, compressed)
+		require.NoError(t, err)
+
+		var req prompb.WriteRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+
+		mu.Lock()
+		requests = append(requests, &req)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := WriteClientConfig{
+		URL:                                   *serverURL,
+		UserID:                                "test",
+		SeriesCount:                           numSeries,
+		ReplicasPerSample:                     replicasPerSample,
+		DuplicatedSamplesDistributionStrategy: DifferentSeries,
+		WriteInterval:                         10 * time.Second,
+		WriteTimeout:                          5 * time.Second,
+		WriteConcurrency:                      10,
+		WriteBatchSize:                        1000,
+	}
+
+	c := NewWriteClient(cfg, log.NewNopLogger())
+	c.writeSeries()
+
+	// A single request, holding every copy as its own series entry (rather than one
+	// merged entry per wave, or one request per copy).
+	require.Len(t, requests, 1)
+	require.Len(t, requests[0].Timeseries, numSeries*replicasPerSample)
+
+	seriesByWave := map[string][]*prompb.TimeSeries{}
+	for _, series := range requests[0].Timeseries {
+		require.Len(t, series.Samples, 1)
+		wave := labelValue(series.Labels, "wave")
+		seriesByWave[wave] = append(seriesByWave[wave], series)
+	}
+
+	require.Len(t, seriesByWave, numSeries)
+	for wave, series := range seriesByWave {
+		assert.Lenf(t, series, replicasPerSample, "wave %s", wave)
 	}
 }

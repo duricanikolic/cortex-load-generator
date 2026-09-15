@@ -64,9 +64,6 @@ type WriteClientConfig struct {
 	// Number of extra labels to generate per write request.
 	ExtraLabels int
 
-	// Number of different samples to generate in each series.
-	SamplesPerSeries int
-
 	// Number of occurrences of each sample within a single series.
 	ReplicasPerSample int
 
@@ -123,73 +120,39 @@ func (c *WriteClient) writeSeries() {
 
 	wg := sync.WaitGroup{}
 
-	if c.cfg.DuplicatedSamplesDistributionStrategy == DifferentRequest {
-		// Group the series by "copy level": level 0 holds every series' original
-		// sample, level 1 holds every series' first duplicate, and so on. Each level
-		// is then sent through its own wave of batched requests (honoring
-		// WriteBatchSize), so a single request never mixes series from different
-		// copies.
-		for _, seriesAtLevel := range transposeTimeSeries(seriesGroups) {
-			for o := 0; o < len(seriesAtLevel); o += c.cfg.WriteBatchSize {
-				wg.Add(1)
+	// generateSineWaveSeries already grouped the series the way cfg.
+	// DuplicatedSamplesDistributionStrategy needs them sent: a single group for
+	// SameSeries/DifferentSeries, or one group per duplicate copy for
+	// DifferentRequest. Either way, each group is independently sent through its own
+	// wave of batched requests (honoring WriteBatchSize), so a single request never
+	// mixes series across groups.
+	for _, group := range seriesGroups {
+		for o := 0; o < len(group); o += c.cfg.WriteBatchSize {
+			wg.Add(1)
 
-				go func(seriesAtLevel []*prompb.TimeSeries, o int) {
-					defer wg.Done()
+			go func(group []*prompb.TimeSeries, o int) {
+				defer wg.Done()
 
-					// Honor the max concurrency
-					ctx := context.Background()
-					_ = c.writeGate.Start(ctx)
-					defer c.writeGate.Done()
+				// Honor the max concurrency
+				ctx := context.Background()
+				_ = c.writeGate.Start(ctx)
+				defer c.writeGate.Done()
 
-					end := o + c.cfg.WriteBatchSize
-					if end > len(seriesAtLevel) {
-						end = len(seriesAtLevel)
-					}
+				end := o + c.cfg.WriteBatchSize
+				if end > len(group) {
+					end = len(group)
+				}
 
-					req := &prompb.WriteRequest{
-						Timeseries: seriesAtLevel[o:end],
-					}
+				req := &prompb.WriteRequest{
+					Timeseries: group[o:end],
+				}
 
-					err := c.send(ctx, req)
-					if err != nil {
-						level.Error(c.logger).Log("msg", "failed to write series", "err", err)
-					}
-				}(seriesAtLevel, o)
-			}
+				err := c.send(ctx, req)
+				if err != nil {
+					level.Error(c.logger).Log("msg", "failed to write series", "err", err)
+				}
+			}(group, o)
 		}
-
-		wg.Wait()
-		return
-	}
-
-	series := flattenTimeSeries(seriesGroups)
-
-	// Honor the batch size.
-	for o := 0; o < len(series); o += c.cfg.WriteBatchSize {
-		wg.Add(1)
-
-		go func(o int) {
-			defer wg.Done()
-
-			// Honor the max concurrency
-			ctx := context.Background()
-			_ = c.writeGate.Start(ctx)
-			defer c.writeGate.Done()
-
-			end := o + c.cfg.WriteBatchSize
-			if end > len(series) {
-				end = len(series)
-			}
-
-			req := &prompb.WriteRequest{
-				Timeseries: series[o:end],
-			}
-
-			err := c.send(ctx, req)
-			if err != nil {
-				level.Error(c.logger).Log("msg", "failed to write series", "err", err)
-			}
-		}(o)
 	}
 
 	wg.Wait()
@@ -241,12 +204,16 @@ func alignTimestampToInterval(ts time.Time, interval time.Duration) time.Time {
 	return time.Unix(0, (ts.UnixNano()/int64(interval))*int64(interval))
 }
 
-// generateSineWaveSeries returns, for each of the cfg.SeriesCount series, the list of
-// prompb.TimeSeries entries that carry it (and its duplicates, if any) — so the outer
-// slice has dimension cfg.SeriesCount, and each inner slice has dimension
-// cfg.ReplicasPerSample (or 1 when cfg.DuplicatedSamplesDistributionStrategy is SameSeries).
+// generateSineWaveSeries returns the cfg.SeriesCount series, each replicated
+// cfg.ReplicasPerSample times, already grouped the way writeSeries() needs to send
+// them for cfg.DuplicatedSamplesDistributionStrategy: a single group holding every
+// series (with duplicates merged into it for SameSeries, or kept as separate entries
+// for DifferentSeries), or one group per duplicate copy for DifferentRequest.
 func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) [][]*prompb.TimeSeries {
-	out := make([][]*prompb.TimeSeries, 0, cfg.SeriesCount)
+	perCopy := make([][]*prompb.TimeSeries, cfg.ReplicasPerSample)
+	for r := range perCopy {
+		perCopy[r] = make([]*prompb.TimeSeries, 0, cfg.SeriesCount)
+	}
 
 	// Generate the extra labels.
 	extraLabels := make([]*prompb.Label, 0, cfg.ExtraLabels)
@@ -255,37 +222,6 @@ func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) [][]*prompb.Time
 			Name:  fmt.Sprintf("extraLabel%d", j),
 			Value: "default",
 		})
-	}
-
-	// Generate the samples: timestamps uniformly distributed between t and t+cfg.WriteInterval,
-	// each with its own value based on its timestamp, and each replicated cfg.ReplicasPerSample
-	// times. Depending on cfg.DuplicatedSamplesValueStrategy, replicas of the same sample either
-	// all share the same value or each get their own distinct value.
-	//
-	// samples[r] holds the cfg.SamplesPerSeries samples belonging to replica r, so there are
-	// cfg.ReplicasPerSample slices of cfg.SamplesPerSeries elements each.
-	samples := make([][]prompb.Sample, cfg.ReplicasPerSample)
-	for r := 0; r < cfg.ReplicasPerSample; r++ {
-		samples[r] = make([]prompb.Sample, 0, cfg.SamplesPerSeries)
-	}
-
-	for i := 0; i < cfg.SamplesPerSeries; i++ {
-		sampleTs := t.Add(cfg.WriteInterval * time.Duration(i) / time.Duration(cfg.SamplesPerSeries))
-
-		for r := 0; r < cfg.ReplicasPerSample; r++ {
-			replicaValue := generateSineWaveValue(sampleTs)
-			if cfg.DuplicatedSamplesValueStrategy == DifferentValue && r > 0 {
-				// A sub-millisecond offset would be rounded away by the float64 conversion
-				// inside generateSineWaveValue for typical (post-1970) timestamps, producing
-				// the same value as r == 0. Millisecond offsets are coarse enough to survive it.
-				replicaValue = generateSineWaveValue(sampleTs.Add(time.Duration(r) * time.Millisecond))
-			}
-
-			samples[r] = append(samples[r], prompb.Sample{
-				Value:     replicaValue,
-				Timestamp: sampleTs.UnixMilli(),
-			})
-		}
 	}
 
 	for seriesID := 1; seriesID <= cfg.SeriesCount; seriesID++ {
@@ -321,13 +257,45 @@ func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) [][]*prompb.Time
 			}
 			return labels[i].Value < labels[j].Value
 		})
-		out = append(out, distributeSamples(samples, labels, cfg))
+
+		// Generate the sample, replicated cfg.ReplicasPerSample times. Depending on
+		// cfg.DuplicatedSamplesValueStrategy, replicas either all share the same value
+		// or each get their own distinct value.
+		for r := 0; r < cfg.ReplicasPerSample; r++ {
+			replicaValue := generateSineWaveValue(t)
+			if cfg.DuplicatedSamplesValueStrategy == DifferentValue && r > 0 {
+				// A sub-millisecond offset would be rounded away by the float64 conversion
+				// inside generateSineWaveValue for typical (post-1970) timestamps, producing
+				// the same value as r == 0. Millisecond offsets are coarse enough to survive it.
+				replicaValue = generateSineWaveValue(t.Add(time.Duration(r) * time.Millisecond))
+			}
+
+			perCopy[r] = append(perCopy[r], &prompb.TimeSeries{
+				Labels: labels,
+				Samples: []prompb.Sample{{
+					Value:     replicaValue,
+					Timestamp: t.UnixMilli(),
+				}},
+			})
+		}
 	}
 
-	return out
+	switch cfg.DuplicatedSamplesDistributionStrategy {
+	case DifferentRequest:
+		// One group per duplicate copy: writeSeries() will send each as its own wave
+		// of requests, so a request never mixes series from different copies.
+		return perCopy
+	case SameSeries:
+		// A single group, with every series' duplicates merged into its one entry.
+		return [][]*prompb.TimeSeries{mergeCopiesPerSeries(perCopy)}
+	default:
+		// DifferentSeries (and the zero value): a single group, with every copy kept
+		// as its own series entry.
+		return [][]*prompb.TimeSeries{flattenTimeSeries(perCopy)}
+	}
 }
 
-// flattenTimeSeries concatenates every series group, in order, into a single slice.
+// flattenTimeSeries concatenates every copy group, in order, into a single slice.
 func flattenTimeSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
 	total := 0
 	for _, group := range groups {
@@ -342,53 +310,28 @@ func flattenTimeSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
 	return out
 }
 
-// transposeTimeSeries turns a [series][copy] grouping into a [copy][series] one: the
-// returned outer slice has one entry per copy level (e.g. level 0 is every series'
-// original sample, level 1 is every series' first duplicate, and so on), and each of
-// those holds one TimeSeries per input group, in the same order as groups.
-func transposeTimeSeries(groups [][]*prompb.TimeSeries) [][]*prompb.TimeSeries {
+// mergeCopiesPerSeries merges the copy groups returned by generateSineWaveSeries back
+// into a single prompb.TimeSeries per series, concatenating all of that series' copies'
+// samples together (so a series' duplicates live in the same series entry).
+func mergeCopiesPerSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
 	if len(groups) == 0 {
 		return nil
 	}
 
-	levels := make([][]*prompb.TimeSeries, len(groups[0]))
-	for l := range levels {
-		levels[l] = make([]*prompb.TimeSeries, 0, len(groups))
-	}
+	out := make([]*prompb.TimeSeries, len(groups[0]))
+	for i := range out {
+		samples := make([]prompb.Sample, 0, len(groups))
+		for _, copyGroup := range groups {
+			samples = append(samples, copyGroup[i].Samples...)
+		}
 
-	for _, group := range groups {
-		for l, series := range group {
-			levels[l] = append(levels[l], series)
+		out[i] = &prompb.TimeSeries{
+			Labels:  groups[0][i].Labels,
+			Samples: samples,
 		}
 	}
 
-	return levels
-}
-
-func distributeSamples(samples [][]prompb.Sample, labels []*prompb.Label, cfg WriteClientConfig) []*prompb.TimeSeries {
-	if cfg.DuplicatedSamplesDistributionStrategy == DifferentSeries || cfg.DuplicatedSamplesDistributionStrategy == DifferentRequest {
-		out := make([]*prompb.TimeSeries, 0, cfg.ReplicasPerSample)
-		// Distribute each replica to its own series entry, duplicating the labels so
-		// that they still identify the same underlying series.
-		for r := 0; r < cfg.ReplicasPerSample; r++ {
-			out = append(out, &prompb.TimeSeries{
-				Labels:  labels,
-				Samples: samples[r],
-			})
-		}
-		return out
-	}
-
-	// Put every replica of every sample into the same series, keeping samples
-	// ordered by timestamp and, for a given timestamp, by replica.
-	seriesSamples := make([]prompb.Sample, 0, cfg.SamplesPerSeries*cfg.ReplicasPerSample)
-	for r := 0; r < cfg.ReplicasPerSample; r++ {
-		seriesSamples = append(seriesSamples, samples[r]...)
-	}
-	return []*prompb.TimeSeries{{
-		Labels:  labels,
-		Samples: seriesSamples,
-	}}
+	return out
 }
 
 func generateSineWaveValue(t time.Time) float64 {
