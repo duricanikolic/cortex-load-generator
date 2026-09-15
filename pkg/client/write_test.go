@@ -212,9 +212,13 @@ func TestGenerateSineWaveSeries_WithReplicas(t *testing.T) {
 					}
 					expected = [][]*prompb.TimeSeries{merged}
 				default: // DifferentSeries
+					// Series-major: every copy of series 1, then every copy of series 2,
+					// etc., so a series' duplicates stay contiguous.
 					flat := make([]*prompb.TimeSeries, 0, tc.replicasPerSample*numSeries)
-					for r := 0; r < tc.replicasPerSample; r++ {
-						flat = append(flat, perCopy[r]...)
+					for i := 0; i < numSeries; i++ {
+						for r := 0; r < tc.replicasPerSample; r++ {
+							flat = append(flat, perCopy[r][i])
+						}
 					}
 					expected = [][]*prompb.TimeSeries{flat}
 				}
@@ -467,5 +471,79 @@ func TestWriteClient_DifferentSeriesBatchesAllCopiesTogether(t *testing.T) {
 	require.Len(t, seriesByWave, numSeries)
 	for wave, series := range seriesByWave {
 		assert.Lenf(t, series, replicasPerSample, "wave %s", wave)
+	}
+}
+
+func TestWriteClient_DifferentSeriesKeepsEachSeriesDuplicatesInTheSameRequest(t *testing.T) {
+	const (
+		numSeries         = 6
+		replicasPerSample = 4
+		writeBatchSize    = 8 // a multiple of replicasPerSample, so batching splits between series, never within one.
+	)
+
+	var (
+		mu       sync.Mutex
+		requests []*prompb.WriteRequest
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compressed, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		data, err := snappy.Decode(nil, compressed)
+		require.NoError(t, err)
+
+		var req prompb.WriteRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+
+		mu.Lock()
+		requests = append(requests, &req)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := WriteClientConfig{
+		URL:                                   *serverURL,
+		UserID:                                "test",
+		SeriesCount:                           numSeries,
+		ReplicasPerSample:                     replicasPerSample,
+		DuplicatedSamplesValueStrategy:        DifferentValue,
+		DuplicatedSamplesDistributionStrategy: DifferentSeries,
+		WriteInterval:                         10 * time.Second,
+		WriteTimeout:                          5 * time.Second,
+		WriteConcurrency:                      10,
+		WriteBatchSize:                        writeBatchSize,
+	}
+
+	c := NewWriteClient(cfg, log.NewNopLogger())
+	c.writeSeries()
+
+	requestsPerWave := map[string]int{}
+	for _, req := range requests {
+		assert.LessOrEqual(t, len(req.Timeseries), writeBatchSize)
+
+		wavesInThisRequest := map[string]int{}
+		for _, series := range req.Timeseries {
+			wave := labelValue(series.Labels, "wave")
+			wavesInThisRequest[wave]++
+		}
+
+		// A wave present in this request must show up with all its replicas: if it
+		// were split across two requests, it would appear here with fewer than
+		// replicasPerSample entries.
+		for wave, count := range wavesInThisRequest {
+			require.Equalf(t, replicasPerSample, count, "wave %s split across requests", wave)
+			requestsPerWave[wave]++
+		}
+	}
+
+	require.Len(t, requestsPerWave, numSeries)
+	for wave, count := range requestsPerWave {
+		assert.Equalf(t, 1, count, "wave %s appeared in more than one request", wave)
 	}
 }

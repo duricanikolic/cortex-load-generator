@@ -291,20 +291,26 @@ func generateSineWaveSeries(t time.Time, cfg WriteClientConfig) [][]*prompb.Time
 	default:
 		// DifferentSeries (and the zero value): a single group, with every copy kept
 		// as its own series entry.
-		return [][]*prompb.TimeSeries{flattenTimeSeries(perCopy)}
+		return [][]*prompb.TimeSeries{flattenInSeriesOrder(perCopy)}
 	}
 }
 
-// flattenTimeSeries concatenates every copy group, in order, into a single slice.
-func flattenTimeSeries(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
-	total := 0
-	for _, group := range groups {
-		total += len(group)
+// flattenInSeriesOrder concatenates the copy groups returned by generateSineWaveSeries
+// in series-major order: every copy of series 1, then every copy of series 2, and so
+// on. This keeps a given series' duplicates contiguous, so batching by WriteBatchSize
+// only ever splits between series, never in the middle of one series' duplicates.
+func flattenInSeriesOrder(groups [][]*prompb.TimeSeries) []*prompb.TimeSeries {
+	if len(groups) == 0 {
+		return nil
 	}
 
-	out := make([]*prompb.TimeSeries, 0, total)
-	for _, group := range groups {
-		out = append(out, group...)
+	numSeries := len(groups[0])
+	out := make([]*prompb.TimeSeries, 0, numSeries*len(groups))
+
+	for i := 0; i < numSeries; i++ {
+		for _, group := range groups {
+			out = append(out, group[i])
+		}
 	}
 
 	return out
