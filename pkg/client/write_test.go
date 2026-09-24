@@ -265,6 +265,86 @@ func TestMergeCopiesPerSeries(t *testing.T) {
 	assert.Equal(t, expected, mergeCopiesPerSeries(groups))
 }
 
+func TestGenerateSineWaveSeries_OutOfOrder(t *testing.T) {
+	const (
+		numSeries     = 3
+		churnPeriod   = 0
+		writeInterval = 10 * time.Second
+	)
+
+	testCases := map[string]struct {
+		replicasPerSample int
+		valueStrategy     DuplicatedSamplesValueStrategy
+	}{
+		"single occurrence": {
+			replicasPerSample: 1,
+			valueStrategy:     SameValue,
+		},
+		"multiple occurrences, same value": {
+			replicasPerSample: 4,
+			valueStrategy:     SameValue,
+		},
+		"multiple occurrences, different value": {
+			replicasPerSample: 4,
+			valueStrategy:     DifferentValue,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			assertGeneratedSeries := func(t *testing.T, ts time.Time) {
+				oooTs := ts.Add(-oooTimestampOffset)
+				currentValue := generateSineWaveValue(ts)
+
+				// expected[0] is the current-timestamp wave (never duplicated).
+				// expected[1..replicasPerSample] are the out-of-order wave's
+				// occurrences, at oooTs.
+				expected := make([][]*prompb.TimeSeries, tc.replicasPerSample+1)
+				expected[0] = make([]*prompb.TimeSeries, 0, numSeries)
+				for seriesID := 1; seriesID <= numSeries; seriesID++ {
+					expected[0] = append(expected[0], &prompb.TimeSeries{
+						Labels:  []*prompb.Label{{Name: "__name__", Value: "cortex_load_generator_sine_wave"}, {Name: "wave", Value: strconv.Itoa(seriesID)}},
+						Samples: []prompb.Sample{{Timestamp: ts.UnixMilli(), Value: currentValue}},
+					})
+				}
+
+				for r := 0; r < tc.replicasPerSample; r++ {
+					oooValue := generateSineWaveValue(oooTs)
+					if tc.valueStrategy == DifferentValue && r > 0 {
+						oooValue = generateSineWaveValue(oooTs.Add(time.Duration(r) * time.Millisecond))
+					}
+
+					expected[r+1] = make([]*prompb.TimeSeries, 0, numSeries)
+					for seriesID := 1; seriesID <= numSeries; seriesID++ {
+						expected[r+1] = append(expected[r+1], &prompb.TimeSeries{
+							Labels:  []*prompb.Label{{Name: "__name__", Value: "cortex_load_generator_sine_wave"}, {Name: "wave", Value: strconv.Itoa(seriesID)}},
+							Samples: []prompb.Sample{{Timestamp: oooTs.UnixMilli(), Value: oooValue}},
+						})
+					}
+				}
+
+				cfg := WriteClientConfig{
+					SeriesCount:                           numSeries,
+					SeriesChurnPeriod:                     churnPeriod,
+					ReplicasPerSample:                     tc.replicasPerSample,
+					DuplicatedSamplesValueStrategy:        tc.valueStrategy,
+					DuplicatedSamplesDistributionStrategy: OutOfOrder,
+					WriteInterval:                         writeInterval,
+				}
+				assert.Equal(t, expected, generateSineWaveSeries(ts, cfg))
+			}
+
+			ts, err := time.Parse(time.RFC3339, "2023-06-29T00:00:00Z")
+			require.NoError(t, err)
+
+			for i := 0; i < 10; i++ {
+				assertGeneratedSeries(t, ts)
+				ts = ts.Add(writeInterval)
+			}
+		})
+	}
+}
+
 func labelValue(labels []*prompb.Label, name string) string {
 	for _, l := range labels {
 		if l.Name == name {
@@ -545,5 +625,92 @@ func TestWriteClient_DifferentSeriesKeepsEachSeriesDuplicatesInTheSameRequest(t 
 	require.Len(t, requestsPerWave, numSeries)
 	for wave, count := range requestsPerWave {
 		assert.Equalf(t, 1, count, "wave %s appeared in more than one request", wave)
+	}
+}
+
+func TestWriteClient_OutOfOrderSendsWavesSequentially(t *testing.T) {
+	const (
+		numSeries         = 2
+		replicasPerSample = 3
+		wave0Delay        = 100 * time.Millisecond
+	)
+
+	var (
+		mu          sync.Mutex
+		requests    []*prompb.WriteRequest
+		arrivalTime []time.Time
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compressed, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		data, err := snappy.Decode(nil, compressed)
+		require.NoError(t, err)
+
+		var req prompb.WriteRequest
+		require.NoError(t, proto.Unmarshal(data, &req))
+
+		mu.Lock()
+		isFirst := len(requests) == 0
+		requests = append(requests, &req)
+		arrivalTime = append(arrivalTime, time.Now())
+		mu.Unlock()
+
+		if isFirst {
+			// Simulate a slow ack for the current-timestamp wave, to prove the
+			// client waits for it before sending any out-of-order wave.
+			time.Sleep(wave0Delay)
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	cfg := WriteClientConfig{
+		URL:                                   *serverURL,
+		UserID:                                "test",
+		SeriesCount:                           numSeries,
+		ReplicasPerSample:                     replicasPerSample,
+		DuplicatedSamplesDistributionStrategy: OutOfOrder,
+		WriteInterval:                         10 * time.Second,
+		WriteTimeout:                          5 * time.Second,
+		WriteConcurrency:                      10,
+		WriteBatchSize:                        1000,
+	}
+
+	c := NewWriteClient(cfg, log.NewNopLogger())
+
+	start := time.Now()
+	c.writeSeries()
+
+	// replicasPerSample+1 waves, one request each (batch size fits everything).
+	require.Len(t, requests, replicasPerSample+1)
+
+	// Every request after the first must have arrived only after wave 0's
+	// (artificially slow) response, proving writeSeries() waited for it before
+	// sending the next wave.
+	for i := 1; i < len(arrivalTime); i++ {
+		assert.GreaterOrEqualf(t, arrivalTime[i].Sub(start), wave0Delay, "request %d arrived before wave 0 was acknowledged", i)
+	}
+
+	// Content: request 0 carries the current timestamp, the rest carry the
+	// out-of-order timestamp (oooTimestampOffset behind), each with numSeries series.
+	require.Len(t, requests[0].Timeseries, numSeries)
+	for _, series := range requests[0].Timeseries {
+		require.Len(t, series.Samples, 1)
+	}
+	currentTs := requests[0].Timeseries[0].Samples[0].Timestamp
+	oooTs := currentTs - oooTimestampOffset.Milliseconds()
+
+	for _, req := range requests[1:] {
+		require.Len(t, req.Timeseries, numSeries)
+		for _, series := range req.Timeseries {
+			require.Len(t, series.Samples, 1)
+			assert.Equal(t, oooTs, series.Samples[0].Timestamp)
+		}
 	}
 }
